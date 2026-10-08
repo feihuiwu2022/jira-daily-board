@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """首次配置向导：收集用户配置并保存到 ~/.jira_board_config.json
 
-由 助手 调用，参数从对话中收集的用户回答传入。
+由助手调用，参数从对话中收集的用户回答传入。
 
 用法：
-  python setup_wizard.py --auth browser --jql-url "https://jira.example.com/issues/?jql=..." --base-url "https://xxx.feishu.cn/base/TOKEN"
+  python setup_wizard.py --auth browser --pat-token <浏览器里自动生成的 Token> --jql-url "https://jira.example.com/issues/?jql=..." --create-base
   python setup_wizard.py --auth pat --pat-token xxx --jql-file jql.txt --base-token TOKEN
-  echo 密码 | python setup_wizard.py --auth credentials --user 工号 --password-stdin   # 助手 在对话中收集密码后调用
+  echo 密码 | python setup_wizard.py --auth credentials --user 工号 --password-stdin   #助手在对话中收集密码后调用
   python setup_wizard.py --auth credentials --user 工号      # 用户自己在终端运行时，交互输入密码
   python setup_wizard.py --create-base                          # 在「我的空间/jira-daily-board」下自动建多维表格
   python setup_wizard.py --create-base --feishu-folder "项目/看板"  # 或指定路径 / 飞书文件夹链接
@@ -30,8 +30,6 @@ def verify_auth(cfg):
     """验证授权，返回 (status, message)，status 为 ok / auth / network。
     PAT 验证通过后记下实际可用的头格式。"""
     method = cfg.get("auth_method")
-    if method == "browser":
-        return "ok", "浏览器授权需要由 助手 在浏览器中验证（fetch /rest/api/2/myself）"
     base = cfg.get("jira_base") or jc.DEFAULT_BASE
     try:
         auth, me = jc.login(base, jc.auth_candidates(cfg, cm.decrypt_creds))
@@ -45,9 +43,9 @@ def verify_auth(cfg):
 
 
 def check_jql(cfg):
-    """校验 JQL 并保存（含已收集的授权信息），让 助手 不必再问用户"确认 JQL 吗"。
+    """校验 JQL 并保存（含已收集的授权信息），让助手不必再问用户"确认 JQL 吗"。
     退出码 0 + __JQL_OK__ <条数>；5 + __JQL_ERROR__（JQL 写错）；2 授权失败；3 连不上 Jira。
-    浏览器模式无法在这里查，输出 __JQL_CHECK_IN_BROWSER__ <JQL>，由 助手 在浏览器里查条数。"""
+    取数和校验都由本机 Python 直接调 Jira REST API 完成。"""
     if not cfg.get("jql"):
         print("__JQL_ERROR__ 没有提取到 JQL（链接里需要 jql= 或 filter= 参数）")
         sys.exit(5)
@@ -57,9 +55,6 @@ def check_jql(cfg):
     jql, start = jc.windowed_jql(cfg["jql"], cfg.get("weeks", 9))
     cm.save(cfg)
     print(f"[setup] JQL：{cfg['jql']}")
-    if cfg.get("auth_method") == "browser":
-        print(f"__JQL_CHECK_IN_BROWSER__ {jql}")
-        return
     base = cfg.get("jira_base") or jc.DEFAULT_BASE
     try:
         auth, _ = jc.login(base, jc.auth_candidates(cfg, cm.decrypt_creds))
@@ -87,7 +82,9 @@ def main():
     ap.add_argument("--reset", action="store_true", help="清除配置")
     ap.add_argument("--check", action="store_true", help="检查配置是否完整")
 
-    ap.add_argument("--auth", choices=["browser", "pat", "credentials"], help="授权方式")
+    ap.add_argument("--auth", choices=["browser", "pat", "credentials"],
+                    help="授权方式。browser = 用户在浏览器登录后，由助手在页面里自动生成 PAT，再用 --pat-token 传入；"
+                         "之后和 pat 一样由 Python 直接调 REST API 取数")
     ap.add_argument("--jira-base", default="", help="Jira 地址")
     ap.add_argument("--pat-token", default="", help="PAT Token")
     ap.add_argument("--user", default="", help="工号")
@@ -147,7 +144,12 @@ def main():
     cfg = cm.load()
 
     if a.auth:
-        cfg["auth_method"] = a.auth
+        # 浏览器登录只是获取 Token 的方式，保存后按 PAT 使用；pat_source 记录来源，过期时助手知道该怎么重新获取
+        cfg["auth_method"] = "pat" if a.auth == "browser" else a.auth
+        if a.auth in ("browser", "pat"):
+            cfg["pat_source"] = a.auth
+        if a.auth == "browser" and not (a.pat_token or cfg.get("pat_token")):
+            sys.exit("[setup] 浏览器登录方式需要先在已登录的 Jira 页面生成 Token，再用 --pat-token 传入（见 SKILL.md ①-A）")
     if a.jira_base:
         cfg["jira_base"] = a.jira_base.rstrip("/")
     if a.pat_token:

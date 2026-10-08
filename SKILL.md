@@ -11,7 +11,11 @@ description: "Jira 问题日清看板：从内网 Jira 拉取数据，同步到�
 
 ## 首次配置（交互式引导）
 
-先运行 `python setup_wizard.py --check`：退出码 0 表示已配置，直接进入「日常运行」；否则按下面步骤**一步一问**，每步等用户回答后再进入下一步；能自动判断的（如 JQL 是否有效）不要再让用户确认。
+**取数原则：Jira 数据一律由本机 Python 按 JQL 调 REST API 拉取（`daily_board.py`），数据直接写盘。不要用 browser evaluate 拉取或搬运问题数据，也不要自己写 curl / 临时脚本分批拉取——几千条问题有十几 MB，经过对话会卡住。浏览器只用于登录和生成 Token。**
+
+先运行 `python setup_wizard.py --check`：
+- 退出码 0（已有配置）→ 把输出的配置摘要给用户看，问一句"沿用这份配置直接更新看板吗？回车 = 是；说『重新配置』则重新开始"。用户确认就进入「日常运行」；要重新配置则执行 `python setup_wizard.py --reset` 后从 ① 开始。
+- 否则按下面步骤**一步一问**，每步等用户回答后再进入下一步；能自动判断的（如 JQL 是否有效）不要再让用户确认。
 
 ### 第 0 步：确认飞书授权
 
@@ -30,12 +34,18 @@ description: "Jira 问题日清看板：从内网 Jira 拉取数据，同步到�
         C. 工号 + 密码
 ```
 
-**A. 浏览器登录**
+**A. 浏览器登录（自动生成 Token）**
 1. `browser navigate` 打开 `{jira_base}/login.jsp`，提示"请在浏览器中登录，完成后告诉我"。
-2. 用户说登录好了 → `browser evaluate`：
-   `fetch('/rest/api/2/myself',{credentials:'include'}).then(r=>r.ok?r.json():{status:r.status})`
-   返回里有 `displayName` 即成功；否则提示"登录验证失败，请在浏览器中重新登录后告诉我"，重复本步。
-3. 记下授权方式 `browser`，进入 ②。
+2. 用户说登录好了 → 在该页面 `browser evaluate` 生成一个 Personal Access Token（只返回一个 Token，数据量很小）：
+   ```js
+   fetch('/rest/pat/latest/tokens',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json','X-Atlassian-Token':'no-check'},body:JSON.stringify({name:'jira-daily-board',expirationDuration:90})}).then(async r=>({status:r.status,body:await r.json().catch(()=>null)}))
+   ```
+   - `status` 为 200/201 且 `body.rawToken` 有值 → 成功。记下 Token，**不要在回复里显示它**。
+   - `status` 401/403 → 还没登录成功，提示"请在浏览器中重新登录后告诉我"，重复本步。
+   - `status` 404 或 Token 生成被禁用 → 这台 Jira 不支持 PAT，改用 C（工号 + 密码）。
+   - 管理员限制了有效期时，把 `expirationDuration` 改小（单位：天）重试。
+3. 进入 ②。校验 JQL 时一起传：`setup_wizard.py --auth browser --pat-token {rawToken} --jql-url "{链接}" --check-jql`。
+   之后取数和 PAT 完全一样，由 Python 直接调 REST API。
 
 **B. Personal Access Token**
 1. 引导用户：打开 `{jira_base}/secure/ViewProfile.jspa` → 左侧 "Personal Access Tokens" → "Create Token" → 起名（如 `jira-board`）→ 复制 Token（只显示一次）并粘贴给助手。
@@ -68,13 +78,10 @@ description: "Jira 问题日清看板：从内网 Jira 拉取数据，同步到�
 
 收到后**不要再问"JQL 确认没问题吗"**，直接自动校验：
 
-- PAT / 工号密码：`python setup_wizard.py --jql-url "{链接}" --check-jql`（JQL 用 `--jql "{JQL}"`；授权参数还没保存的话一并带上）
+- `python setup_wizard.py --jql-url "{链接}" --check-jql`（JQL 用 `--jql "{JQL}"`；授权参数还没保存的话一并带上）
   - `__JQL_OK__ <条数>` → 校验通过
   - `__JQL_ERROR__ …`（退出码 5）→ 告诉用户 JQL 有误并附错误原因，请重新提供，停在本步
   - 退出码 2 / 3 → 按授权失败 / 连不上 Jira 处理
-- 浏览器登录：同一命令会输出 `__JQL_CHECK_IN_BROWSER__ <带时间窗的 JQL>`，助手在已登录的浏览器里查条数：
-  `fetch('/rest/api/2/search',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({jql:<JQL>,maxResults:0})}).then(r=>r.json())`
-  返回 `total` 即校验通过；返回 `errorMessages` 即 JQL 有误。
 
 校验通过后，**在同一条回复里**直接给出 ③，不要等用户确认。
 
@@ -102,7 +109,7 @@ description: "Jira 问题日清看板：从内网 Jira 拉取数据，同步到�
 把收集到的内容一次性交给向导（没改的项不用传）：
 
 ```bash
-python setup_wizard.py --auth browser --jql-url "{链接}" --create-base \
+python setup_wizard.py --jql-url "{链接}" --create-base \
   [--feishu-folder "{链接或路径}"] [--mail-to "a@x.com"] [--schedule-time "17:00"] \
   [--title "XX 项目 · 问题日清看板"] [--weeks 13]
 ```
@@ -125,33 +132,23 @@ python setup_wizard.py --auth browser --jql-url "{链接}" --create-base \
 
 ## 日常运行
 
-用户说"更新看板""生成今天的看板"，或到达定时时间（助手 按 `schedule_time` 创建每日定时任务）时执行。
-
-### PAT / 工号密码模式
+用户说"更新看板""生成今天的看板"，或到达定时时间（助手按 `schedule_time` 创建每日定时任务）时执行。三种授权方式都一样，只需要一条命令：
 
 ```bash
 python daily_board.py
 ```
 
-### 浏览器登录模式
-
-1. `python daily_board.py --emit-browser-script` → 输出 `__BROWSER_SCRIPT__ {路径}`，生成带当天 JQL（含时间窗）的取数脚本。
-2. 浏览器打开 `{jira_base}/secure/Dashboard.jspa`，`browser evaluate` 执行该脚本**文件内容**。
-3. 返回 JSON：
-   - `error == "AUTH_EXPIRED"` → 提示用户在浏览器中重新登录，登录后回到第 2 步；
-   - `ok == true` → 原样写入 `_work/browser_fetch_result.json`。
-4. `python daily_board.py`（加不加 `--skip-fetch` 都会导入比 issues.json 新的浏览器结果）。
+脚本按 JQL 分页调 REST API（500 条/页，2000 多条问题约 5 次请求），再批量取评论、同步飞书，全程不需要浏览器。等它运行结束再读输出，不要中途改用其他方式取数。
 
 ### 输出标记与处理
 
 | 输出 | 含义 | 助手的处理 |
 |---|---|---|
-| `__AUTH_EXPIRED__` | Jira 授权失效 | 浏览器模式：重新登录后重跑；PAT：引导重新生成 Token 并 `setup_wizard.py --pat-token`；工号密码：重新询问密码并用 `--password-stdin` 重新保存 |
-| `__BROWSER_FETCH_REQUIRED__` | 缺少当天的浏览器取数结果 | 执行「浏览器登录模式」第 1–3 步 |
+| `__AUTH_EXPIRED__` | Jira 授权失效（Token 过期/撤销，或密码已改） | 浏览器登录方式：按 ①-A 重新登录并生成 Token，`setup_wizard.py --auth browser --pat-token {新 Token}`；PAT：引导重新生成 Token 并 `setup_wizard.py --pat-token`；工号密码：重新询问密码并用 `--password-stdin` 重新保存。然后重跑 `daily_board.py` |
 | `[daily] !! 同步失败` | 飞书写入失败 | 明细表已自动回滚、旧数据保留；检查飞书授权和表字段后重跑 |
 | 退出码 0 | 成功 | 把 `out/看板摘要_YYYY-MM-DD.txt` 的内容和多维表格链接发给用户；配置了 `mail_to` 时按 `title` 作标题发送邮件 |
 
-其他参数：`--check-auth` 只检查授权；`--print-jql` 打印实际 JQL；`--allow-stale` 允许导入非当天的浏览器结果。
+其他参数：`--check-auth` 只检查授权；`--print-jql` 打印实际 JQL；`--skip-fetch` 不重新取数、只用上次的数据重新同步。
 
 ## 飞书多维表格结构
 
@@ -231,7 +228,6 @@ python daily_board.py
 | `lark_cli.py` | lark-cli 调用封装 |
 | `site_defaults.example.json` | 站点默认值模板：复制为 `site_defaults.json` 填写本单位的 Jira 地址、飞书域名、lark-cli 路径/profile |
 | `config_manager.py` | 配置读写、链接解析、凭证加解密 |
-| `jira_fetch_browser.js` | 浏览器取数脚本模板（由 `--emit-browser-script` 填入 JQL） |
 | `fetch_jira.py` | 独立取数调试工具（日常流程不用） |
 
 产物：`_work/issues.json`、`_work/comments.json`（原始数据），`out/看板摘要_YYYY-MM-DD.txt`（保留 30 份）。

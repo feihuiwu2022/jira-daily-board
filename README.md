@@ -35,9 +35,11 @@ Jira 授权三选一：
 
 | 方式 | 说明 |
 |---|---|
-| 浏览器登录（推荐） | 用户在浏览器中登录 Jira，密码不经过对话 |
+| 浏览器登录（推荐） | 用户在浏览器中登录 Jira，助手在页面里自动生成一个 Personal Access Token；密码不经过对话 |
 | Personal Access Token | Jira 个人设置 → Personal Access Tokens 生成 |
-| 工号 + 密码 | 可直接在对话里给 助手（经标准输入传给向导，不进命令行），或自己在终端输入；DPAPI 加密保存到本机 |
+| 工号 + 密码 | 可直接在对话里给助手（经标准输入传给向导，不进命令行），或自己在终端输入；DPAPI 加密保存到本机 |
+
+无论哪种方式，取数都由本机 Python 按 JQL 直接调 Jira REST API 完成（分页 500 条/次），数据直接写盘，不经过浏览器。
 
 ```bash
 python setup_wizard.py --auth pat --pat-token <TOKEN> \
@@ -51,27 +53,17 @@ python setup_wizard.py --auth pat --pat-token <TOKEN> \
 - `--show` 查看配置，`--check` 检查是否完整，`--reset` 清除配置
 - `--create-base` 默认在「我的空间」根目录的 `jira-daily-board` 文件夹里创建；用 `--feishu-folder "项目/看板"` 或飞书文件夹链接指定其他位置。重复执行会复用同名多维表格
 - 已有多维表格时可改用 `--base-url` / `--detail-table-url` / `--snapshot-table-url`
-- 退出码：0 成功；1 缺必填项；2 Jira 授权验证失败；3 连不上 Jira；4 飞书多维表格创建失败
+- `--check-jql` 只校验 JQL（查命中条数）；退出码：0 成功；1 缺必填项；2 Jira 授权验证失败；3 连不上 Jira；4 飞书多维表格创建失败；5 JQL 有误
 
 ### 2. 更新看板
 
-PAT / 工号密码模式：
-
 ```bash
-python daily_board.py
-```
-
-浏览器登录模式：
-
-```bash
-python daily_board.py --emit-browser-script   # 生成带当天 JQL 的取数脚本
-# 在已登录 Jira 的浏览器页面执行该脚本，把返回的 JSON 存为 _work/browser_fetch_result.json
 python daily_board.py
 ```
 
 其他参数：`--check-auth` 只检查授权，`--print-jql` 打印实际 JQL，`--skip-fetch` 复用已有数据。
 
-脚本会输出 `__AUTH_EXPIRED__`、`__BROWSER_FETCH_REQUIRED__` 等标记，助手 据此提示用户重新登录或重新取数，详见 [`SKILL.md`](SKILL.md#输出标记与处理)。
+Token 过期或密码失效时脚本会输出 `__AUTH_EXPIRED__`，助手据此引导重新授权，详见 [`SKILL.md`](SKILL.md#输出标记与处理)。
 
 ## 统计口径
 
@@ -102,7 +94,6 @@ python daily_board.py
 | `lark_cli.py` | lark-cli 调用封装 |
 | `site_defaults.example.json` | 站点默认值模板：复制为 `site_defaults.json` 填写本单位的 Jira 地址、飞书域名、lark-cli 路径/profile |
 | `config_manager.py` | 配置读写、链接解析、凭证加解密 |
-| `jira_fetch_browser.js` | 浏览器取数脚本模板 |
 | `fetch_jira.py` | 独立取数调试工具 |
 
 ## 注意事项

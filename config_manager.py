@@ -3,7 +3,7 @@
 """看板配置管理：读写 ~/.jira_board_config.json
 
 配置项：
-  auth_method    : browser | pat | credentials   （必选）
+  auth_method    : pat | credentials   （必选；浏览器登录生成的 Token 也存为 pat，pat_source=browser）
   jira_base      : Jira 地址（必填；配置时从筛选链接自动提取）
   pat_token      : PAT token（auth_method=pat 时）
   jql            : JQL 查询语句（必选）
@@ -149,7 +149,9 @@ def validate(cfg):
     """校验必填项，返回 (ok, errors)"""
     errors = []
     if not cfg.get("auth_method"):
-        errors.append("auth_method 未设置（browser / pat / credentials）")
+        errors.append("auth_method 未设置（pat / credentials）")
+    if cfg.get("auth_method") == "browser":
+        errors.append("旧版浏览器取数方式已停用：请重新授权（浏览器登录后自动生成 Token，或直接提供 PAT）")
     if cfg.get("auth_method") == "pat" and not cfg.get("pat_token"):
         errors.append("auth_method=pat 但 pat_token 为空")
     if cfg.get("auth_method") == "credentials" and not cfg.get("_encrypted_creds"):
@@ -255,7 +257,8 @@ def base_url(cfg):
 
 def show_config(cfg):
     """格式化显示当前配置"""
-    auth_display = {"browser": "浏览器登录", "pat": "PAT Token", "credentials": "工号+密码（加密存储）"}
+    auth_display = {"pat": "浏览器登录（自动生成 Token）" if cfg.get("pat_source") == "browser" else "PAT Token",
+                    "credentials": "工号+密码（加密存储）"}
     weeks_display = cfg.get("weeks", 9)
     if weeks_display == 0:
         weeks_display = "全部"
