@@ -10,7 +10,7 @@
 日清快照表：按日期 upsert。
 任何一步失败都以非 0 退出码结束。
 """
-import argparse, datetime as dt, json, os, sys
+import argparse, datetime as dt, hashlib, json, os, re, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(HERE, "_work")
@@ -28,6 +28,8 @@ SNAPSHOT_FIELDS = ["日期", "问题总数", "今日新增", "今日解决", "�
 SEV_OPTIONS = ("S", "A", "B+", "B", "C")
 STAGE_OPTIONS = ("0/4", "1/4", "2/4", "3/4", "4/4", "挂起", "跟踪中")
 AG_OPTIONS = ("正常", "预警", "超时", "严重超时")
+FP_FIELD = "同步指纹"   # 行内容的哈希。每天只重写内容变化了的行，不再整表删除重建
+KEY_RE = re.compile(r"\[([^\]]+)\]")
 
 
 # ─── 同步 ───────────────────────────────────────────────────────────
@@ -50,40 +52,104 @@ def detail_rows(recs, jira_base):
     return rows
 
 
-def writable_columns(lark, table_id):
-    """问题明细表里实际存在的扩展列。老表没有这些列时跳过，不影响同步。"""
-    try:
-        names = lark.field_names(table_id)
-    except LarkError as e:
-        print(f"  [warn] 读取字段列表失败，扩展列不写入: {e}")
-        return []
-    missing = [c for c in EXTRA_COLUMNS if c not in names]
-    if missing:
-        print(f"  [warn] 问题明细表缺少字段 {missing}，这些列不写入"
-              f"（运行 setup_wizard.py --repair-base 可自动补齐）")
-    return [c for c in EXTRA_COLUMNS if c in names]
+def _text(v):
+    """record-list 返回的文本单元格可能是字符串、[{"text":…}] 片段列表或对象，统一成字符串"""
+    if isinstance(v, list):
+        return "".join(_text(x) for x in v)
+    if isinstance(v, dict):
+        return str(v.get("text") or v.get("link") or v.get("value") or v.get("name") or "")
+    return "" if v is None else str(v)
 
 
-def replace_detail(lark, table_id, rows):
-    """先写新数据、再删旧数据；写入失败则删掉本次已写入的部分，旧数据不动"""
-    extra = writable_columns(lark, table_id)
-    fields = DETAIL_FIELDS + extra
-    keep = len(DETAIL_FIELDS)
-    idx = [keep + EXTRA_COLUMNS.index(c) for c in extra]
-    rows = [r[:keep] + [r[i] for i in idx] for r in rows]
-    old_ids = lark.list_record_ids(table_id)
-    print(f"  表中现有 {len(old_ids)} 条，开始写入 {len(rows)} 条新数据")
+def _issue_key(v):
+    t = _text(v).strip()
+    m = KEY_RE.match(t)
+    return m.group(1) if m else t
+
+
+def fingerprint(row):
+    return hashlib.sha1(json.dumps(row, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def _create_with_rollback(lark, table_id, fields, rows, before_ids):
     try:
         lark.create_rows(table_id, fields, rows, "问题明细")
     except LarkError:
         print("  [rollback] 写入失败，回滚本次已写入的记录，保留旧数据…")
         try:
-            old = set(old_ids)
+            old = set(before_ids)
             lark.delete_records(table_id, [x for x in lark.list_record_ids(table_id) if x not in old], "回滚")
         except LarkError as e:
             print(f"  [rollback] 回滚失败，表中可能有重复数据，请手动检查: {e}")
         raise
-    lark.delete_records(table_id, old_ids, "删除旧数据")
+
+
+def replace_detail(lark, table_id, rows):
+    """同步问题明细表。
+
+    有「同步指纹」列时增量同步：只删掉内容变了或 Jira 里已不在的行，只写入新行和变化的行；
+    已闭环、没有变化的问题不动。没有该列（老表）时退回整表替换：先写新数据、再删旧数据。
+    任何写入失败都会回滚本次已写入的记录，旧数据保持不动。"""
+    t0 = time.time()
+    try:
+        names = lark.field_names(table_id)
+    except LarkError as e:
+        print(f"  [warn] 读取字段列表失败，扩展列不写入: {e}")
+        names = set()
+    extra = [c for c in EXTRA_COLUMNS if c in names]
+    missing = [c for c in EXTRA_COLUMNS + [FP_FIELD] if names and c not in names]
+    if missing:
+        print(f"  [warn] 问题明细表缺少字段 {missing}（运行 setup_wizard.py --repair-base 可自动补齐）")
+    keep = len(DETAIL_FIELDS)
+    idx = [keep + EXTRA_COLUMNS.index(c) for c in extra]
+    rows = [r[:keep] + [r[i] for i in idx] for r in rows]
+    fields = DETAIL_FIELDS + extra
+    incremental = FP_FIELD in names
+    if incremental:
+        fields = fields + [FP_FIELD]
+        rows = [r + [fingerprint(r)] for r in rows]
+
+    existing = lark.list_records(table_id, fields=["编号", FP_FIELD] if incremental else ["编号"])
+    print(f"  表中现有 {len(existing)} 条，Jira 本次 {len(rows)} 条（读取用时 {time.time() - t0:.0f}s）")
+    old_ids = [rid for rid, _ in existing]
+
+    if incremental:
+        have = {}      # 编号 → (record_id, 指纹)
+        dup_ids = []   # 同一编号的重复行（历史遗留），一并删除
+        for rid, vals in existing:
+            key = _issue_key(vals.get("编号"))
+            if key in have or not key:
+                dup_ids.append(rid)
+            else:
+                have[key] = (rid, _text(vals.get(FP_FIELD)).strip())
+        if existing and not have:
+            print("  [warn] 读不出已有记录的编号，改为整表替换")
+            incremental = False
+
+    if not incremental:
+        _create_with_rollback(lark, table_id, fields, rows, old_ids)
+        lark.delete_records(table_id, old_ids, "删除旧数据")
+        print(f"  [问题明细] 整表替换完成，用时 {time.time() - t0:.0f}s")
+        return
+
+    new_keys, to_create, to_delete = set(), [], list(dup_ids)
+    for r in rows:
+        key = _issue_key(r[0])
+        new_keys.add(key)
+        hit = have.get(key)
+        if hit and hit[1] == r[-1]:
+            continue            # 内容没变，保留
+        to_create.append(r)
+        if hit:
+            to_delete.append(hit[0])
+    to_delete += [rid for key, (rid, _) in have.items() if key not in new_keys]
+    unchanged = len(rows) - len(to_create)
+    print(f"  [问题明细] 不变 {unchanged} 条，新增/变化 {len(to_create)} 条，删除 {len(to_delete)} 条")
+    if to_create:
+        _create_with_rollback(lark, table_id, fields, to_create, old_ids)
+    if to_delete:
+        lark.delete_records(table_id, to_delete, "删除旧行")
+    print(f"  [问题明细] 增量同步完成，用时 {time.time() - t0:.0f}s")
 
 
 def upsert_snapshot(lark, table_id, now, row):
@@ -143,6 +209,7 @@ def sync(cfg, issues_path=None, comments_path=None):
     lark = Lark(cfg)
     jira_base = doc.get("base_url") or cfg.get("jira_base") or cm.DEFAULTS["jira_base"]
 
+    t0 = time.time()
     print(f"\n[upload] 问题明细表 {cfg['detail_table']}")
     replace_detail(lark, cfg["detail_table"], detail_rows(recs, jira_base))
 
@@ -152,7 +219,7 @@ def sync(cfg, issues_path=None, comments_path=None):
         st["week_done"], st["timeout"], st["warn"], st["unclosed"]])
 
     update_views(lark, cfg, now)
-    print(f"\n[sync] 完成！问题明细 {st['total']} 条")
+    print(f"\n[sync] 完成！问题明细 {st['total']} 条，飞书同步用时 {time.time() - t0:.0f}s")
     print(f"[sync] 摘要: 总数={st['total']} 新增={st['today_new']} 解决={st['today_done']} "
           f"超时={st['timeout']} 预警={st['warn']} 未闭环={st['unclosed']}")
     return now, st

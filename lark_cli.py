@@ -68,22 +68,37 @@ class Lark:
             except OSError:
                 pass
 
-    def list_record_ids(self, table_id):
-        ids, seen, offset = [], set(), 0
+    def list_records(self, table_id, fields=None):
+        """分页读取记录，返回 [(record_id, {字段名: 值})]。fields 只读取指定字段（数据量小、速度快）"""
+        out, seen, offset = [], set(), 0
+        field_args = [x for f in (fields or []) for x in ("--field-id", f)]
         while True:
             res = self.run(["base", "+record-list", "--base-token", self.base, "--table-id", table_id,
-                            "--limit", str(BATCH_SIZE), "--offset", str(offset), "--format", "json"],
+                            "--limit", str(BATCH_SIZE), "--offset", str(offset), "--format", "json"] + field_args,
                            "读取记录")
             data = res.get("data", {}) if isinstance(res, dict) else {}
-            page = [x for x in data.get("record_id_list", []) if x not in seen]
+            ids = data.get("record_id_list", []) or []
+            rows = data.get("data") or []
+            names = data.get("fields") or data.get("field_names") or fields or []
+            names = [n.get("name") if isinstance(n, dict) else n for n in names]
+            page = []
+            for i, rid in enumerate(ids):
+                if rid in seen:
+                    continue
+                row = rows[i] if i < len(rows) else None
+                vals = dict(zip(names, row)) if isinstance(row, list) else (row if isinstance(row, dict) else {})
+                page.append((rid, vals))
             if not page:
                 break
-            ids.extend(page)
-            seen.update(page)
+            out.extend(page)
+            seen.update(rid for rid, _ in page)
             if not data.get("has_more", False):
                 break
             offset += BATCH_SIZE
-        return ids
+        return out
+
+    def list_record_ids(self, table_id):
+        return [rid for rid, _ in self.list_records(table_id, fields=["编号"])]
 
     def delete_records(self, table_id, record_ids, label=""):
         for i in range(0, len(record_ids), BATCH_SIZE):

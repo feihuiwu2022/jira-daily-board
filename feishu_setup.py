@@ -50,7 +50,8 @@ DETAIL_SCHEMA = [
     {"type": "text", "name": "周分桶"},
     {"type": "text", "name": "最新进展"},
     {"type": "text", "name": "Jira状态"},
-] + [{"type": "text", "name": c} for c in EXTRA_COLUMNS]
+] + [{"type": "text", "name": c} for c in EXTRA_COLUMNS] + [
+    {"type": "text", "name": "同步指纹", "description": "同步脚本用来判断这一行是否变化，请勿修改"}]
 
 SNAPSHOT_SCHEMA = [{"type": "datetime", "name": "日期", "style": {"format": "yyyy-MM-dd"}}] + [
     _number(n) for n in ("问题总数", "今日新增", "今日解决", "本周新增", "本周解决", "超时数", "预警数", "未闭环数")]
@@ -232,6 +233,16 @@ def ensure_fields(lark, table_id, table_name, schema):
         print(f"[feishu] [warn] 「{table_name}」补充字段失败: {e}")
 
 
+def _hide_fingerprint(lark, base_args, view):
+    """视图里隐藏「同步指纹」列（只是展示设置，失败不影响同步）"""
+    visible = [f["name"] for f in DETAIL_SCHEMA if f["name"] != "同步指纹"]
+    try:
+        lark.run(["base", "+view-set-visible-fields"] + base_args + ["--view-id", view, "--json",
+                  _json({"visible_fields": visible})], f"设置视图字段 {view}", require_ok=False)
+    except LarkError:
+        pass
+
+
 def ensure_views(lark, table_id, new_base=False):
     try:
         views = lark.data(["base", "+view-list", "--base-token", lark.base, "--table-id", table_id],
@@ -249,6 +260,7 @@ def ensure_views(lark, table_id, new_base=False):
             else:
                 lark.run(["base", "+view-create"] + base_args + ["--json", _json({"name": DEFAULT_VIEW, "type": "grid"})],
                          f"创建视图 {DEFAULT_VIEW}")
+            _hide_fingerprint(lark, base_args, DEFAULT_VIEW)
             print(f"[feishu] 已创建视图「{DEFAULT_VIEW}」")
         except LarkError as e:
             print(f"[feishu] [warn] {e}")
@@ -265,6 +277,7 @@ def ensure_views(lark, table_id, new_base=False):
                 lark.run(["base", "+view-set-group"] + base_args + ["--view-id", name, "--json",
                           _json({"group_config": [{"field": group, "desc": False}]})],
                          f"设置视图分组 {name}", require_ok=False)
+            _hide_fingerprint(lark, base_args, name)
             if sort:
                 lark.run(["base", "+view-set-sort"] + base_args + ["--view-id", name, "--json",
                           _json({"sort_config": [{"field": f, "desc": d} for f, d in sort]})],

@@ -14,7 +14,7 @@
 
 产物在 ./out/ ：看板摘要_YYYY-MM-DD.txt
 """
-import argparse, datetime as dt, glob, json, os, sys
+import argparse, datetime as dt, glob, json, os, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "out")
@@ -116,9 +116,11 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     os.makedirs(WORK, exist_ok=True)
 
+    t0 = time.time()
     try:
         if not a.skip_fetch:
             fetch_via_rest(cfg, jql)
+            print(f"[jira] 取数用时 {time.time() - t0:.0f}s", flush=True)
         if not os.path.exists(ISSUES):
             raise jc.JiraError("没有可用的 issues.json，请去掉 --skip-fetch 重新取数")
     except jc.JiraAuthError as e:
