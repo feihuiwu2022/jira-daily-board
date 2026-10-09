@@ -126,6 +126,9 @@ python setup_wizard.py --jql-url "{链接}" --create-base \
 **补充说明**
 - 扩展列的 Jira 字段：问题来源默认取「缺陷来源」(customfield_10220)；缺陷类型、问题原因大类按 Jira 字段名自动查找。查不到时该列为空，可在配置 `extra_fields` 里指定，如 `{"缺陷类型": "customfield_12345"}`。
 - 已有的多维表格缺字段、视图或仪表盘组件（例如用旧版本建的表）：`python setup_wizard.py --repair-base`，只补缺的，不改动已有内容和布局。
+- `--create-base` / `--repair-base` 最后会输出一行「检查结果：问题明细视图 x/10，仪表盘组件 y/13」，把这一行原样告诉用户。
+  输出 `__FEISHU_INCOMPLETE__` 时，同时把「缺少视图/组件」和 `[问题]` 那几行发给用户（这是当前 lark-cli 版本不支持某些命令导致的，需要维护者适配），不要自己改用其他方式去建。
+  旧版 lark-cli 不支持的写法会自动降级：视图筛选改用旧写法，条形图 / 环形图改为柱状图 / 饼图。
 - 已经有现成的多维表格、不想新建时（少见），用 `--base-url "{多维表格链接}" --detail-table-url "{问题明细表链接}" --snapshot-table-url "{日清快照表链接}"` 代替 `--create-base`，再执行一次 `--repair-base` 补齐。
 
 其他命令：`--show` 查看配置，`--check` 检查是否完整，`--reset` 清除配置。

@@ -243,48 +243,75 @@ def _hide_fingerprint(lark, base_args, view):
         pass
 
 
+def _legacy_filter(flt):
+    """旧版 lark-cli 的筛选写法（is / isGreater …）。新写法失败时用它重试一次"""
+    conds = []
+    for c in flt["conditions"]:
+        field, op, value = c[0], c[1], (c[2] if len(c) > 2 else None)
+        if op == "intersects":
+            conds += [[field, "is", v] for v in value] if len(value) > 1 else [[field, "is", value[0]]]
+        else:
+            conds.append([field, "is" if op == "==" else op, value])
+    logic = "or" if any(c[1] == "intersects" and len(c[2]) > 1 for c in flt["conditions"]) else flt.get("logic", "and")
+    return {"logic": logic, "conditions": conds}
+
+
+def _try(lark, args, what, problems, payloads=None):
+    """依次尝试 payloads（新写法、旧写法），全部失败时记录原因；返回是否成功"""
+    last = None
+    for extra in (payloads or [[]]):
+        try:
+            lark.run(args + extra, what, require_ok=False)
+            return True
+        except LarkError as e:
+            last = e
+    problems.append(f"{what}：{last}")
+    return False
+
+
 def ensure_views(lark, table_id, new_base=False):
+    """创建缺少的视图（按名称判断）。返回 (已有+新建的视图名集合, 问题列表)"""
+    problems = []
     try:
         views = lark.data(["base", "+view-list", "--base-token", lark.base, "--table-id", table_id],
                           "读取视图").get("views") or []
-    except LarkError:
+    except LarkError as e:
+        problems.append(f"读取视图列表：{e}")
         views = []
     existing = {_first(v, "name", "view_name") for v in views}
     base_args = ["--base-token", lark.base, "--table-id", table_id]
     if DEFAULT_VIEW not in existing:
-        try:
-            if new_base and views:  # 新建的表：把默认表格视图改名为「问题总表」
-                lark.run(["base", "+view-rename"] + base_args +
-                         ["--view-id", _first(views[0], "id", "view_id"), "--name", DEFAULT_VIEW],
-                         "重命名默认视图", require_ok=False)
-            else:
-                lark.run(["base", "+view-create"] + base_args + ["--json", _json({"name": DEFAULT_VIEW, "type": "grid"})],
-                         f"创建视图 {DEFAULT_VIEW}")
+        if new_base and views:  # 新建的表：把默认表格视图改名为「问题总表」
+            ok = _try(lark, ["base", "+view-rename"] + base_args +
+                      ["--view-id", _first(views[0], "id", "view_id"), "--name", DEFAULT_VIEW],
+                      f"重命名默认视图为 {DEFAULT_VIEW}", problems)
+        else:
+            ok = _try(lark, ["base", "+view-create"] + base_args +
+                      ["--json", _json({"name": DEFAULT_VIEW, "type": "grid"})], f"创建视图 {DEFAULT_VIEW}", problems)
+        if ok:
+            existing.add(DEFAULT_VIEW)
             _hide_fingerprint(lark, base_args, DEFAULT_VIEW)
             print(f"[feishu] 已创建视图「{DEFAULT_VIEW}」")
-        except LarkError as e:
-            print(f"[feishu] [warn] {e}")
     for name, flt, group, sort in DETAIL_VIEWS:
         if name in existing:
             continue
-        try:
-            lark.run(["base", "+view-create"] + base_args + ["--json", _json({"name": name, "type": "grid"})],
-                     f"创建视图 {name}")
-            if flt:
-                lark.run(["base", "+view-set-filter"] + base_args + ["--view-id", name, "--json", _json(flt)],
-                         f"设置视图筛选 {name}", require_ok=False)
-            if group:
-                lark.run(["base", "+view-set-group"] + base_args + ["--view-id", name, "--json",
-                          _json({"group_config": [{"field": group, "desc": False}]})],
-                         f"设置视图分组 {name}", require_ok=False)
-            _hide_fingerprint(lark, base_args, name)
-            if sort:
-                lark.run(["base", "+view-set-sort"] + base_args + ["--view-id", name, "--json",
-                          _json({"sort_config": [{"field": f, "desc": d} for f, d in sort]})],
-                         f"设置视图排序 {name}", require_ok=False)
-            print(f"[feishu] 已创建视图「{name}」")
-        except LarkError as e:
-            print(f"[feishu] [warn] {e}")
+        if not _try(lark, ["base", "+view-create"] + base_args + ["--json", _json({"name": name, "type": "grid"})],
+                    f"创建视图 {name}", problems):
+            continue
+        existing.add(name)
+        view_args = base_args + ["--view-id", name]
+        if flt:
+            _try(lark, ["base", "+view-set-filter"] + view_args, f"设置视图筛选 {name}", problems,
+                 [["--json", _json(flt)], ["--json", _json(_legacy_filter(flt))]])
+        if group:
+            _try(lark, ["base", "+view-set-group"] + view_args, f"设置视图分组 {name}", problems,
+                 [["--json", _json({"group_config": [{"field": group, "desc": False}]})]])
+        if sort:
+            _try(lark, ["base", "+view-set-sort"] + view_args, f"设置视图排序 {name}", problems,
+                 [["--json", _json({"sort_config": [{"field": f, "desc": d} for f, d in sort]})]])
+        _hide_fingerprint(lark, base_args, name)
+        print(f"[feishu] 已创建视图「{name}」")
+    return existing, problems
 
 
 def _items(data, *keys):
@@ -294,40 +321,76 @@ def _items(data, *keys):
     return []
 
 
+TYPE_FALLBACK = {"bar": "column", "ring": "pie"}  # 旧版 lark-cli 不认识时退回的图表类型
+
+
+def _list_blocks(lark, did):
+    for extra in (["--page-size", "100"], []):
+        try:
+            data = lark.data(["base", "+dashboard-block-list", "--base-token", lark.base,
+                              "--dashboard-id", did] + extra, "读取仪表盘组件")
+            return {_first(b, "name", "block_name") for b in _items(data, "items", "blocks")}
+        except LarkError:
+            continue
+    return None
+
+
 def ensure_dashboard(lark):
-    """创建仪表盘；已存在时只补上缺少的组件（按组件名判断），不动已有组件和布局"""
+    """创建仪表盘；已存在时只补上缺少的组件（按组件名判断），不动已有组件和布局。
+    返回 (已有+新建的组件名集合, 问题列表)"""
+    problems, have = [], set()
     try:
         boards = lark.data(["base", "+dashboard-list", "--base-token", lark.base], "读取仪表盘")
-        did, have = "", set()
+        did = ""
         for b in _items(boards, "dashboards", "items"):
             if _first(b, "name", "dashboard_name") == DASHBOARD:
                 did = _first(b, "dashboard_id", "block_id", "id")
+        created_board, fallback_board = False, False
         if did:
-            blocks = lark.data(["base", "+dashboard-block-list", "--base-token", lark.base,
-                                "--dashboard-id", did, "--page-size", "100"], "读取仪表盘组件")
-            have = {_first(b, "name", "block_name") for b in _items(blocks, "items", "blocks")}
-        else:
-            data = lark.data(["base", "+dashboard-create", "--base-token", lark.base, "--name", DASHBOARD],
-                             "创建仪表盘")
+            listed = _list_blocks(lark, did)
+            if listed is None:
+                # 读不到已有组件就无法判断缺哪些；为避免重复，另建一个完整的仪表盘
+                problems.append(f"读取「{DASHBOARD}」的组件失败，已另建「{DASHBOARD}（完整）」")
+                did, fallback_board = "", True
+            else:
+                have = listed
+        if not did:
+            name = f"{DASHBOARD}（完整）" if fallback_board else DASHBOARD
+            data = lark.data(["base", "+dashboard-create", "--base-token", lark.base, "--name", name], "创建仪表盘")
             did = _first(data.get("dashboard") or {}, "dashboard_id", "block_id", "id")
             if not did:
                 raise LarkError("创建仪表盘成功但没有返回 dashboard_id")
+            created_board = True
         todo = [b for b in DASHBOARD_BLOCKS if b[0] not in have]
         for name, typ, conf in todo:  # 必须串行创建
-            try:
-                lark.run(["base", "+dashboard-block-create", "--base-token", lark.base, "--dashboard-id", did,
-                          "--name", name, "--type", typ, "--data-config", _json(conf)], f"创建组件 {name}")
-            except LarkError as e:
-                print(f"[feishu] [warn] {e}")
-        if not have and todo:  # 只有新建的仪表盘才自动整理布局
-            lark.run(["base", "+dashboard-arrange", "--base-token", lark.base, "--dashboard-id", did],
-                     "整理仪表盘布局", require_ok=False)
-        if todo:
-            print(f"[feishu] 仪表盘「{DASHBOARD}」已添加 {len(todo)} 个组件：{'、'.join(b[0] for b in todo)}")
-        else:
-            print(f"[feishu] 仪表盘「{DASHBOARD}」组件齐全")
+            types = [typ] + ([TYPE_FALLBACK[typ]] if typ in TYPE_FALLBACK else [])
+            if _try(lark, ["base", "+dashboard-block-create", "--base-token", lark.base, "--dashboard-id", did,
+                           "--name", name, "--data-config", _json(conf)], f"创建组件 {name}", problems,
+                    [["--type", t] for t in types]):
+                have.add(name)
+        if created_board and todo:  # 只有新建的仪表盘才自动整理布局
+            _try(lark, ["base", "+dashboard-arrange", "--base-token", lark.base, "--dashboard-id", did],
+                 "整理仪表盘布局", problems)
     except LarkError as e:
-        print(f"[feishu] [warn] 仪表盘未能自动创建，可在飞书里手动添加：{e}")
+        problems.append(f"仪表盘：{e}")
+    return have, problems
+
+
+def print_report(views, dash, problems):
+    want_views = [DEFAULT_VIEW] + [v[0] for v in DETAIL_VIEWS]
+    want_blocks = [b[0] for b in DASHBOARD_BLOCKS]
+    miss_v = [v for v in want_views if v not in views]
+    miss_b = [b for b in want_blocks if b not in dash]
+    print(f"\n[feishu] 检查结果：问题明细视图 {len(want_views) - len(miss_v)}/{len(want_views)}，"
+          f"仪表盘组件 {len(want_blocks) - len(miss_b)}/{len(want_blocks)}")
+    if miss_v:
+        print(f"  缺少视图：{'、'.join(miss_v)}")
+    if miss_b:
+        print(f"  缺少组件：{'、'.join(miss_b)}")
+    for p in problems:
+        print(f"  [问题] {p[:300]}")
+    if miss_v or miss_b:
+        print("__FEISHU_INCOMPLETE__")
 
 
 def setup(cfg, folder_spec="", base_name=DEFAULT_BASE_NAME, existing_base=""):
@@ -345,8 +408,9 @@ def setup(cfg, folder_spec="", base_name=DEFAULT_BASE_NAME, existing_base=""):
     tables = list_tables(lark)
     detail_id, _ = ensure_table(lark, tables, DETAIL_TABLE, DETAIL_SCHEMA)
     snapshot_id, _ = ensure_table(lark, tables, SNAPSHOT_TABLE, SNAPSHOT_SCHEMA)
-    ensure_views(lark, detail_id, new_base)
-    ensure_dashboard(lark)
+    views, p1 = ensure_views(lark, detail_id, new_base)
+    dash, p2 = ensure_dashboard(lark)
+    print_report(views, dash, p1 + p2)
     out = {
         "base_token": base_token, "detail_table": detail_id, "snapshot_table": snapshot_id,
         "feishu_folder": folder_token, "feishu_folder_url": folder_url,
